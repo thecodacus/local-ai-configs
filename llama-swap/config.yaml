@@ -1,0 +1,136 @@
+# llama-swap: one OpenAI-compatible endpoint on :8080 in front of every local model.
+#   llamacpp            = the llama.cpp router; every preset in models.ini is selectable by its own name
+#   strata              = Strata, Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS on both GPUs, 128k context (pins ~40 GB RAM while up)
+#   strata-1gpu         = the same on GPU0 only, 128k, with the image encoder on GPU1
+#   qwen-image(-edit)   = Qwen-Image 2.1 on stable-diffusion.cpp, for /v1/images/generations and /v1/images/edits
+# All of them sit in one exclusive group, so only one holds the GPUs at a time. Ask for any model by name and
+# llama-swap stops whatever is running and starts the right backend.
+#
+# Hardware this was tuned on: 2x RTX 3060 12 GB (GPU0 PCIe x8, GPU1 x4), Ryzen 9 7900X, 64 GB DDR5.
+# Measured swap times: llama.cpp router -> Strata (1 GPU) ~34 s, Strata -> router ~15 s.
+
+macros:
+  # ⚠️ Change these to your own paths.
+  models_dir: "/opt/models"                # GGUFs; mounted into the llama.cpp container as /models
+  llama_cpp_dir: "/opt/llama.cpp"          # a llama.cpp checkout with build/bin/llama-server built (CUDA)
+  sdcpp_dir: "/opt/stable-diffusion.cpp"   # a stable-diffusion.cpp checkout with build/bin/sd-server built (CUDA)
+  strata_sh: "/opt/llama-swap/strata.sh"   # strata/strata.sh from this repo
+  cuda_image: "nvidia/cuda:12.4.1-devel-ubuntu22.04"
+
+healthCheckTimeout: 300
+logLevel: info
+startPort: 10001
+includeAliasesInList: true   # list each router preset in /v1/models, so clients can pick them one by one
+sendLoadingState: false      # don't inject loading text into responses (some clients parse reasoning fields)
+
+models:
+  llamacpp:
+    name: "llama.cpp router (models.ini presets)"
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: |
+      docker run --rm --init --name llamacpp-router
+      --gpus all --network host
+      -e LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+      -v ${models_dir}:/models -v ${llama_cpp_dir}:/llama.cpp
+      ${cuda_image}
+      /llama.cpp/build/bin/llama-server
+      --host 127.0.0.1 --port ${PORT}
+      --models-preset /models/models.ini --models-max 1
+    cmdStop: docker stop llamacpp-router
+    unloadTimeout: 60
+    ttl: 0                   # the router itself idles at ~0 VRAM (its presets sleep after 600 s, see models.ini)
+    aliases:                 # keep in sync with the [sections] of models.ini
+      - qwen38-27b-gsq
+      - qwen38-27b-gsq-100k
+      - qwen38-27b-gsq-64k
+      - qwen38-27b-q4km
+      - qwen36-35b-a3b-128k
+      - qwen36-35b-a3b-256k
+      - ornith-35b-128k
+      - ornith-35b-256k
+      - qwen36-35b-uncensored-128k
+
+  strata:
+    name: "Strata: Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS (2 GPUs, 128k)"
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: ${strata_sh} ${PORT}
+    unloadTimeout: 60
+    ttl: 600                 # free the pinned RAM after 10 idle minutes
+    aliases:
+      - qwen38-flash
+
+  strata-1gpu:
+    name: "Strata: Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS (GPU0 only, 128k)"
+    proxy: "http://127.0.0.1:${PORT}"
+    cmd: ${strata_sh} ${PORT} 0 strata-iq3_xxs-1gpu-vision.json   # with the image encoder on GPU1
+    unloadTimeout: 60
+    ttl: 600
+    aliases:
+      - qwen38-flash-1gpu     # ~42 t/s decode vs ~49 on both cards; GPU1 stays free for the image encoder
+
+  # Qwen-Image 2.1 on stable-diffusion.cpp. Weights licence: qwen-research (non-commercial).
+  # The diffusion model runs on GPU0 with its weights streamed from RAM (only what each step needs goes to VRAM):
+  # measured as fast as keeping it in VRAM (73 s of sampling for 1024x1024). The text encoder runs on GPU1.
+  qwen-image:
+    name: "Qwen-Image 2.1 (Q8_0): image generation"
+    proxy: "http://127.0.0.1:${PORT}"
+    checkEndpoint: /          # sd-server has no /health; its page answers once the models are loaded
+    cmd: |
+      docker run --rm --init --name sdcpp-qwen-image
+      --gpus all --network host -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+      -v ${models_dir}/sdcpp:/models:ro -v ${sdcpp_dir}:/sdcpp
+      ${cuda_image}
+      /sdcpp/build/bin/sd-server
+      --listen-ip 127.0.0.1 --listen-port ${PORT}
+      --diffusion-model /models/qwen_image_2.1-Q8_0.gguf
+      --vae /models/qwen_image_2.1_vae_bf16.safetensors
+      --llm /models/Qwen3VL-8B-Instruct-Q8_0.gguf
+      --llm_vision /models/mmproj-Qwen3VL-8B-Instruct-F16.gguf
+      --backend "diffusion=cuda0,te=cuda1,vae=cuda1"
+      --params-backend te=cpu,diffusion=cpu
+      --auto-fit off --diffusion-fa --model-args qwen_image_2_1_prefix_cache_type=q8_0
+      --cfg-scale 1.0 --sampling-method euler --steps 25 --seed -1 -W 1024 -H 1024
+    cmdStop: docker stop sdcpp-qwen-image
+    unloadTimeout: 60
+    ttl: 300                  # free the GPUs 5 idle minutes after the last picture
+    aliases:
+      - qwen-image-2.1
+
+  # The same model for /v1/images/edits: the VAE encode of a big input picture runs out of memory on a 12 GB card
+  # without tiling, and the input is capped at about a megapixel.
+  qwen-image-edit:
+    name: "Qwen-Image 2.1 Edit (Q8_0, VAE tiling)"
+    proxy: "http://127.0.0.1:${PORT}"
+    checkEndpoint: /
+    cmd: |
+      docker run --rm --init --name sdcpp-qwen-image-edit
+      --gpus all --network host -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+      -v ${models_dir}/sdcpp:/models:ro -v ${sdcpp_dir}:/sdcpp
+      ${cuda_image}
+      /sdcpp/build/bin/sd-server
+      --listen-ip 127.0.0.1 --listen-port ${PORT}
+      --diffusion-model /models/qwen_image_2.1-Q8_0.gguf
+      --vae /models/qwen_image_2.1_vae_bf16.safetensors
+      --llm /models/Qwen3VL-8B-Instruct-Q8_0.gguf
+      --llm_vision /models/mmproj-Qwen3VL-8B-Instruct-F16.gguf
+      --backend "diffusion=cuda0,te=cuda1,vae=cuda1"
+      --params-backend te=cpu,diffusion=cpu
+      --auto-fit off --diffusion-fa --model-args qwen_image_2_1_prefix_cache_type=q8_0
+      --cfg-scale 1.0 --sampling-method euler --steps 25 --seed -1
+      --vae-tiling --vae-tile-size 512
+      --ref-image-args vae_input_max_pixels=1048576
+    cmdStop: docker stop sdcpp-qwen-image-edit
+    unloadTimeout: 60
+    ttl: 300
+    aliases:
+      - qwen-image-2.1-edit
+
+routing:
+  router:
+    use: group
+    settings:
+      groups:
+        gpus:
+          swap: true         # one member at a time
+          exclusive: true
+          members: [llamacpp, strata, strata-1gpu, qwen-image, qwen-image-edit]
